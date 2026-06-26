@@ -7,26 +7,23 @@ const cors    = require('cors')
 const app     = express()
 const PORT    = process.env.PORT || 8080
 
+// Allow larger payloads for base64 avatar uploads (~300 KB limit)
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '400kb' }))
 
 // ── DATA STORES ───────────────────────────────────────────────────────────────
-// users: { username -> { token, playing, title, artist, currentTime, duration, lastSeen } }
-const users    = new Map()
-// friends: { username -> Set<username> }  (mutual, both sides stored)
-const friends  = new Map()
-// pendingRequests: { toUsername -> [{from, ts}] }
-const pending  = new Map()
-// jamInvites: { toUsername -> {from, title, jamId, ts} }
+const users      = new Map()
+const friends    = new Map()
+const pending    = new Map()
 const jamInvites = new Map()
-// jamSessions: { jamId -> { host, title, artist, currentTime, playing, lastUpdate, members:Set } }
 const jamSessions = new Map()
-// dms: { "a:b" (sorted) -> [{from, text, ts}] }
-const dms = new Map()
-// dmUnread: { toUsername -> [{from, text, ts}] }
-const dmUnread = new Map()
+const dms        = new Map()
+const dmUnread   = new Map()
+// avatars: { username -> { dataUrl, updatedAt } }
+const avatars    = new Map()
 
-const TIMEOUT = 30000 // 30s offline threshold
+const TIMEOUT    = 30000
+const MAX_AVATAR = 300_000
 
 function touch(username) {
   if (users.has(username)) users.get(username).lastSeen = Date.now()
@@ -53,7 +50,6 @@ app.post('/register', (req, res) => {
   const { username, token } = req.body
   if (!username || !token) return res.json({ error: 'missing_fields' })
 
-  // Allow re-register with same token (reconnect)
   if (users.has(username)) {
     const u = users.get(username)
     if (u.token !== token) return res.json({ error: 'username_taken' })
@@ -89,8 +85,7 @@ app.post('/leave', (req, res) => {
   const { username, token } = req.body
   const u = users.get(username)
   if (u && u.token === token) {
-    u.lastSeen = 0  // Mark offline immediately
-    // Leave any jam sessions
+    u.lastSeen = 0
     for (const [jamId, jam] of jamSessions) {
       if (jam.members.has(username)) {
         jam.members.delete(username)
@@ -107,12 +102,9 @@ app.post('/friend-request', (req, res) => {
   const uf = users.get(from)
   if (!uf || uf.token !== token) return res.status(401).json({ error: 'bad_token' })
   if (!users.has(to)) return res.json({ error: 'user_not_found' })
-
   touch(from)
-
   const myFriends = friends.get(from) || new Set()
   if (myFriends.has(to)) return res.json({ already: true })
-
   const list = pending.get(to) || []
   if (!list.find(r => r.from === from)) {
     list.push({ from, ts: Date.now() })
@@ -136,13 +128,11 @@ app.post('/friend-response', (req, res) => {
   const { from, to, accept, token } = req.body
   const u = users.get(to)
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
-
   touch(to)
   const list = pending.get(to) || []
   const idx  = list.findIndex(r => r.from === from)
   if (idx >= 0) list.splice(idx, 1)
   pending.set(to, list)
-
   if (accept) {
     if (!friends.has(from)) friends.set(from, new Set())
     if (!friends.has(to))   friends.set(to,   new Set())
@@ -152,29 +142,69 @@ app.post('/friend-response', (req, res) => {
   res.json({ ok: true })
 })
 
-// ── FRIENDS LIST (with presence + now playing) ────────────────────────────────
+// ── FRIENDS LIST ──────────────────────────────────────────────────────────────
 app.get('/friends/:username', (req, res) => {
   const { username } = req.params
   const { token } = req.query
   const u = users.get(username)
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
   touch(username)
-
   const myFriends = friends.get(username) || new Set()
   const result = [...myFriends].map(name => {
     const f = users.get(name)
     const online = isOnline(name)
+    const av = avatars.get(name)
     return {
       username: name,
       online,
-      playing:     online ? (f?.playing     || false) : false,
-      title:       online ? (f?.title       || '')    : '',
-      artist:      online ? (f?.artist      || '')    : '',
-      currentTime: online ? (f?.currentTime || 0)     : 0,
-      duration:    online ? (f?.duration    || 0)     : 0,
+      playing:        online ? (f?.playing     || false) : false,
+      title:          online ? (f?.title       || '')    : '',
+      artist:         online ? (f?.artist      || '')    : '',
+      currentTime:    online ? (f?.currentTime || 0)     : 0,
+      duration:       online ? (f?.duration    || 0)     : 0,
+      hasAvatar:      !!av,
+      avatarUpdatedAt: av?.updatedAt || null,
     }
   })
   res.json(result)
+})
+
+// ── UPLOAD AVATAR ─────────────────────────────────────────────────────────────
+app.post('/avatar', (req, res) => {
+  const username = auth(req, res); if (!username) return
+  const { dataUrl } = req.body
+  if (!dataUrl || typeof dataUrl !== 'string')
+    return res.status(400).json({ error: 'missing_dataUrl' })
+  if (!dataUrl.startsWith('data:image/'))
+    return res.status(400).json({ error: 'invalid_format' })
+  if (dataUrl.length > MAX_AVATAR)
+    return res.status(413).json({ error: 'avatar_too_large', maxBytes: MAX_AVATAR })
+  avatars.set(username, { dataUrl, updatedAt: Date.now() })
+  res.json({ ok: true })
+})
+
+// ── DELETE AVATAR ─────────────────────────────────────────────────────────────
+app.delete('/avatar', (req, res) => {
+  const username = auth(req, res); if (!username) return
+  avatars.delete(username)
+  res.json({ ok: true })
+})
+
+// ── GET AVATAR ────────────────────────────────────────────────────────────────
+app.get('/avatar/:target', (req, res) => {
+  const { target } = req.params
+  const { username, token } = req.query
+  const u = users.get(username)
+  if (!username || !token || !u || u.token !== token)
+    return res.status(401).json({ error: 'bad_token' })
+  touch(username)
+  const isSelf   = username === target
+  const isFriend = friends.get(username)?.has(target)
+  if (!isSelf && !isFriend)
+    return res.status(403).json({ error: 'not_friends' })
+  const av = avatars.get(target)
+  if (!av) return res.status(404).json({ error: 'no_avatar' })
+  res.json({ dataUrl: av.dataUrl, updatedAt: av.updatedAt })
 })
 
 // ── JAM INVITE ────────────────────────────────────────────────────────────────
@@ -184,8 +214,6 @@ app.post('/jam-invite', (req, res) => {
   if (!uf || uf.token !== token) return res.status(401).json({ error: 'bad_token' })
   if (!users.has(to)) return res.json({ error: 'user_not_found' })
   touch(from)
-
-  // Create or find jam session for host
   let jamId = null
   for (const [id, jam] of jamSessions) {
     if (jam.host === from) { jamId = id; break }
@@ -202,7 +230,6 @@ app.post('/jam-invite', (req, res) => {
       members: new Set([from])
     })
   }
-
   jamInvites.set(to, { from, title: title || '', jamId, ts: Date.now() })
   res.json({ ok: true, jamId })
 })
@@ -222,7 +249,7 @@ app.get('/jam-invite/:username', (req, res) => {
   }
 })
 
-// ── CLEAR JAM INVITE ─────────────────────────────────────────────────────────
+// ── CLEAR JAM INVITE ──────────────────────────────────────────────────────────
 app.post('/jam-clear/:username', (req, res) => {
   const { username } = req.params
   const { token } = req.body
@@ -238,40 +265,26 @@ app.post('/jam-join', (req, res) => {
   const u = users.get(username)
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
   touch(username)
-
   const jam = jamSessions.get(jamId)
   if (!jam) return res.json({ error: 'jam_not_found' })
-
   jam.members.add(username)
   jamInvites.delete(username)
-
-  // Account for time elapsed since last update
   let syncTime = jam.currentTime
   if (jam.playing && jam.lastUpdate) {
     syncTime += (Date.now() - jam.lastUpdate) / 1000
   }
-
-  res.json({
-    ok: true,
-    host: jam.host,
-    title: jam.title,
-    artist: jam.artist,
-    currentTime: syncTime,
-    playing: jam.playing
-  })
+  res.json({ ok: true, host: jam.host, title: jam.title, artist: jam.artist, currentTime: syncTime, playing: jam.playing })
 })
 
-// ── JAM HEARTBEAT (host pushes position) ─────────────────────────────────────
+// ── JAM SYNC (host pushes position) ──────────────────────────────────────────
 app.post('/jam-sync', (req, res) => {
   const { username, token, jamId, currentTime, playing, title, artist } = req.body
   const u = users.get(username)
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
   touch(username)
-
-  let jam = jamSessions.get(jamId)
+  const jam = jamSessions.get(jamId)
   if (!jam) return res.json({ error: 'jam_not_found' })
   if (jam.host !== username) return res.json({ error: 'not_host' })
-
   jam.currentTime = currentTime ?? jam.currentTime
   jam.playing     = playing     ?? jam.playing
   jam.title       = title       ?? jam.title
@@ -280,30 +293,20 @@ app.post('/jam-sync', (req, res) => {
   res.json({ ok: true })
 })
 
-// ── GET JAM STATE (listeners poll this) ──────────────────────────────────────
+// ── GET JAM STATE ─────────────────────────────────────────────────────────────
 app.get('/jam-state/:jamId', (req, res) => {
   const { jamId } = req.params
   const { username, token } = req.query
   const u = users.get(username)
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
   touch(username)
-
   const jam = jamSessions.get(jamId)
   if (!jam) return res.json({ error: 'jam_not_found' })
-
   let syncTime = jam.currentTime
   if (jam.playing && jam.lastUpdate) {
     syncTime += (Date.now() - jam.lastUpdate) / 1000
   }
-
-  res.json({
-    host: jam.host,
-    title: jam.title,
-    artist: jam.artist,
-    currentTime: syncTime,
-    playing: jam.playing,
-    members: [...jam.members].filter(m => isOnline(m))
-  })
+  res.json({ host: jam.host, title: jam.title, artist: jam.artist, currentTime: syncTime, playing: jam.playing, members: [...jam.members].filter(m => isOnline(m)) })
 })
 
 // ── LEAVE JAM ─────────────────────────────────────────────────────────────────
@@ -328,16 +331,12 @@ app.post('/dm/send', (req, res) => {
   if (!users.has(to)) return res.json({ error: 'user_not_found' })
   if (!text?.trim()) return res.json({ error: 'empty_message' })
   touch(from)
-
   const key = dmKey(from, to)
   if (!dms.has(key)) dms.set(key, [])
   const msg = { from, text: text.trim(), ts: Date.now() }
   dms.get(key).push(msg)
-
-  // Queue as unread for recipient
   if (!dmUnread.has(to)) dmUnread.set(to, [])
   dmUnread.get(to).push(msg)
-
   res.json({ ok: true, ts: msg.ts })
 })
 
@@ -347,8 +346,7 @@ app.get('/dm/history', (req, res) => {
   const u = users.get(username)
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
   touch(username)
-  const key = dmKey(username, withUser)
-  res.json(dms.get(key) || [])
+  res.json(dms.get(dmKey(username, withUser)) || [])
 })
 
 // ── POLL UNREAD DMs ───────────────────────────────────────────────────────────
@@ -359,19 +357,19 @@ app.get('/dm/unread/:username', (req, res) => {
   if (!u || u.token !== token) return res.status(401).json({ error: 'bad_token' })
   touch(username)
   const msgs = dmUnread.get(username) || []
-  dmUnread.set(username, [])  // Clear after read
+  dmUnread.set(username, [])
   res.json(msgs)
 })
 
-// ── CLEANUP stale users every 60s ────────────────────────────────────────────
+// ── CLEANUP ───────────────────────────────────────────────────────────────────
 setInterval(() => {
   for (const [username, u] of users) {
     if (Date.now() - u.lastSeen > 120000) {
       users.delete(username)
+      avatars.delete(username)
     }
   }
   for (const [jamId, jam] of jamSessions) {
-    // Remove offline members
     for (const m of jam.members) {
       if (!isOnline(m)) jam.members.delete(m)
     }
