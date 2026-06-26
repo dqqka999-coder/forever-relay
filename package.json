@@ -1,0 +1,12 @@
+{
+  "name": "forever-relay",
+  "version": "1.0.0",
+  "description": "Relay server for forever music player",
+  "main": "relay-server.js",
+  "scripts": {
+    "start": "node relay-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
